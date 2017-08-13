@@ -3,6 +3,7 @@
 local OneWireCrc = {}
 
 local bit = require("bit")
+local Folding = require("Folding")
 local bxor, band, brshift, blshift = bit.bxor, bit.band, bit.rshift, bit.lshift
 
 local function crc8byte(crc, inbyte)
@@ -27,35 +28,8 @@ local function crc16Byte(crc, byte)
     return band(0xffff, bxor(bxor(bxor(xqq, blshift(xqq, 15)), bxor(blshift(xqq, 14), band(0xff, brshift(crc, 8)))), bxor(blshift(xpp, 6), blshift(xpp, 7))))
 end
 
-function foldl(foldf, initv, array)
-    for _, val in ipairs(array) do
-        initv = foldf(initv, val)
-    end
-    return initv
-end
+function OneWireCrc.crc8 (array) return Folding.foldl(crc8byte, 0, array) end
 
-function mapFilter(mapf, filter, array)
-    return foldl(function (acc, val) if filter(val) then acc[#acc + 1] = mapf(val) end return acc end, {}, array)
-end
+function OneWireCrc.crc16 (array) return Folding.foldl(crc16Byte, 0, array) end
 
-function crc8 (array) return foldl(crc8byte, 0, array) end
-
-function crc16 (array) return foldl(crc16Byte, 0, array) end
-
-local is16BitCrc = false
-
-for _,val in ipairs(arg) do
-    if nil ~= string.find(val, "-16") then is16BitCrc = true break end
-end
-
-local hexes = mapFilter(
-        function(str) return tonumber(str, 16) end,
-        function(str) return nil == string.find(str, "-") end,
-        arg
-    )
-
-if is16BitCrc
-    then print (bit.tohex(crc16(hexes)))
-    else print (bit.tohex(crc8(hexes)))
-end
---foldl(function(acc, val) print(val) return acc end, 0, hexes)
+return OneWireCrc
