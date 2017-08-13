@@ -1,6 +1,8 @@
 #!/usr/bin/lua
 
-bit = require("bit")
+local OneWireCrc = {}
+
+local bit = require("bit")
 local bxor, band, brshift, blshift = bit.bxor, bit.band, bit.rshift, bit.lshift
 
 local function crc8byte(crc, inbyte)
