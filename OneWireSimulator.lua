@@ -171,6 +171,11 @@ function OneWireSimulator.mkOneWireSimulator(deviceArray)
         end
         return cont(foundAddr, addrStart)
     end
+    function myNet.resumeROM(cont)
+        if not sendReset() then return end
+        writeByte(0xa5)
+        return cont(readBytes, writeBytes)
+    end
     return myNet
 end
 
