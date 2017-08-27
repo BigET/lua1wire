@@ -39,91 +39,101 @@ local function mkSendByte(byteToSend, cont)
     return funct
 end
 
-local function mkReadAddress(addr, cont)
-    local currentBit = 0
-    local currentByte = 1
-    local function funct(_)
-        local rez = 0 ~= band(addr[currentByte], blshift(1, currentBit))
-        if currentBit == 7 then
-            currentByte = currentByte + 1
-            currentBit = 0
-        else currentBit = currentBit + 1 end
-        if currentByte == 9 then return rez, cont()
-        else return rez, funct end
-    end
-    return funct
-end
-
-local function mkMatchAddress(addr, contS, contF)
-    local function funct(recvAddress)
-        for i = 1, 8 do if recvAddress[i] ~= addr[i] then return contF() end end
-        return contS()
-    end
-    return mkReceiveBytes(8, funct)
-end
-
-local function mkSearchAddress(addr, contS, contF)
-    local currentBit = 0
-    local currentByte = 1
-    local writeFunct = nil
-    local function readFunct(bitValue)
-        if (bitValue and 0 == band(addr[currentByte], blshift(1, currentBit)))
-                or (not bitValue and 0 ~= band(addr[currentByte], blshift(1, currentBit)))
-            then return bitValue, contF() end
-        if currentBit == 7 then
-            currentByte = currentByte + 1
-            currentBit = 0
-        else currentBit = currentBit + 1 end
-        if currentByte == 9 then return bitValue, contS()
-        else return bitValue, writeFunct end
-    end
-    local function writeNegFunct(bitValue)
-        return 0 == band(addr[currentByte], blshift(1, currentBit)), readFunct
-    end
-    writeFunct = function(bitValue)
-        return 0 ~= band(addr[currentByte], blshift(1, currentBit)), writeNegFunct
-    end
-    return writeFunct
-end
-
-function OneWireSimulator.mkDS2401(addr)
-    local myDev = {}
-    local myAddr = {1}
-    for i = 1,6 do
-        myAddr[i + 1] = addr[i]
-    end
-    myAddr[8] = crc.crc8(myAddr)
+local function mkROMDevice(addr, devIO, isAlerted)
+    local isSelected = false
+    local romDev = {}
+    addr[8] = crc.crc8(addr)
     local function waitReset() return true, waitReset end
-    local function goWaitReset() return waitReset end
     local state = waitReset
+
+    local function goWaitReset() return waitReset end
+
+    local function mkReadAddress()
+        local currentBit = 0
+        local currentByte = 1
+        local function funct(_)
+            local rez = 0 ~= band(addr[currentByte], blshift(1, currentBit))
+            if currentBit == 7 then
+                currentByte = currentByte + 1
+                currentBit = 0
+            else currentBit = currentBit + 1 end
+            if currentByte == 9 then return rez, devIO()
+            else return rez, funct end
+        end
+        return funct
+    end
+
+    local function mkMatchAddress()
+        local function funct(recvAddress)
+            for i = 1, 8 do if recvAddress[i] ~= addr[i] then return waitReset end end
+            isSelected = true
+            return devIO()
+        end
+        return mkReceiveBytes(8, funct)
+    end
+
+    local function mkSearchAddress()
+        local currentBit = 0
+        local currentByte = 1
+        local writeFunct = nil
+        local function readFunct(bitValue)
+            if (bitValue and 0 == band(addr[currentByte], blshift(1, currentBit)))
+                    or (not bitValue and 0 ~= band(addr[currentByte], blshift(1, currentBit)))
+                then return bitValue, waitReset end
+            if currentBit == 7 then
+                currentByte = currentByte + 1
+                currentBit = 0
+            else currentBit = currentBit + 1 end
+            if currentByte == 9 then isSelected = true return bitValue, devIO()
+            else return bitValue, writeFunct end
+        end
+        local function writeNegFunct(bitValue)
+            return 0 == band(addr[currentByte], blshift(1, currentBit)), readFunct
+        end
+        writeFunct = function(bitValue)
+            return 0 ~= band(addr[currentByte], blshift(1, currentBit)), writeNegFunct
+        end
+        return writeFunct
+    end
+
     local function processROMCommand(romCommand)
-        if romCommand == 0x33 or romCommand == 0x0f then return mkReadAddress(myAddr, goWaitReset) end
-        if romCommand == 0xf0 then return mkSearchAddress(myAddr, goWaitReset, goWaitReset) end
+        if romCommand == 0x33 then isSelected = false return mkReadAddress() end
+        if romCommand == 0x55 then isSelected = false return mkMatchAddress() end
+        if romCommand == 0xf0 then return mkSearchAddress() end
+        if romCommand == 0xcc then isSelected = false return devIO() end
+        if romCommand == 0xa5 and isSelected then return devIO() end
         return waitReset
     end
-    function myDev.resetPulse()
+    function romDev.resetPulse()
         state = mkReceiveByte(processROMCommand)
         return true
     end
-    function myDev.bitAssert(bitValue)
+    function romDev.bitAssert(bitValue)
         local resp, newState = state(bitValue)
         state = newState
         return resp
     end
+    return romDev, waitReset
+end
+
+
+function OneWireSimulator.mkDS2401(addr)
+    local myAddr = {1}
+    for i = 1,6 do
+        myAddr[i + 1] = addr[i]
+    end
+    local myDev, waitReset = nil, nil
+    myDev, waitReset = mkROMDevice(myAddr, function () return waitReset end)
     return myDev
 end
 
 function OneWireSimulator.mkDS2413(addr, readIO, writeIO)
-    local myDev = {}
     local myAddr = {0x3a}
-    local isSelected, myPIOA, myPIOB = false, true, true
+    local myPIOA, myPIOB = false, true
     for i = 1,6 do
         myAddr[i + 1] = addr[i]
     end
-    myAddr[8] = crc.crc8(myAddr)
-    local function waitReset() return true, waitReset end
-    local function goWaitReset() return waitReset end
-    local state = waitReset
+    local waitReset = nil
     local function samplePIO()
         local pioa, piob = readIO()
         local octet = 0
@@ -142,7 +152,7 @@ function OneWireSimulator.mkDS2413(addr, readIO, writeIO)
         return mkSendByte(samplePIO(), redoPIOWrite)
     end
     local function setPIO(bytes)
-        if 0xff ~= bxor(bytes[1], bytes[2]) then return goWaitReset end
+        if 0xff ~= bxor(bytes[1], bytes[2]) then return function() return waitReset end end
         myPIOA = 0 ~= band(bytes[1], 1)
         myPIOB = 0 ~= band(bytes[1], 2)
         writeIO(myPIOA, myPIOB)
@@ -159,27 +169,8 @@ function OneWireSimulator.mkDS2413(addr, readIO, writeIO)
     local function pioFunction()
         return mkReceiveByte(processPIO)
     end
-    local function setSelect()
-        isSelected = true
-        return pioFunction()
-    end
-    local function processROMCommand(romCommand)
-        if romCommand == 0x33 then isSelected = false return mkReadAddress(myAddr, pioFunction) end
-        if romCommand == 0x55 then isSelected = false return mkMatchAddress(myAddr, setSelect, goWaitReset) end
-        if romCommand == 0xf0 then return mkSearchAddress(myAddr, setSelect, goWaitReset) end
-        if romCommand == 0xcc then isSelected = false return pioFunction() end
-        if romCommand == 0xa5 and isSelected then return pioFunction() end
-        return waitReset
-    end
-    function myDev.resetPulse()
-        state = mkReceiveByte(processROMCommand)
-        return true
-    end
-    function myDev.bitAssert(bitValue)
-        local resp, newState = state(bitValue)
-        state = newState
-        return resp
-    end
+    local myDev = nil
+    myDev, waitReset =  mkROMDevice(myAddr, pioFunction)
     return myDev
 end
 
@@ -241,9 +232,7 @@ function OneWireSimulator.mkOneWireSimulator(deviceArray)
         writeByte(0xcc)
         return cont(readBytes, writeBytes)
     end
-    function myNet.searchROM(addrStart, cont)
-        if not sendReset() then return end
-        writeByte(0xf0)
+    local function searchAcc(addrStart, cont)
         local lastForkByte, lastForkBit, foundAddr = 0, 0, {0,0,0,0,0,0,0,0}
         for currentByte = 1, 8 do
             for currentBit = 0, 7 do
@@ -271,6 +260,16 @@ function OneWireSimulator.mkOneWireSimulator(deviceArray)
             end
         end
         if 0 == crc.crc8(foundAddr) then return cont(foundAddr, addrStart, readBytes, writeBytes) end
+    end
+    function myNet.searchROM(addrStart, cont)
+        if not sendReset() then return end
+        writeByte(0xf0)
+        searchAcc(addrStart, cont)
+    end
+    function myNet.condSearchROM(addrStart, cont)
+        if not sendReset() then return end
+        writeByte(0xec)
+        searchAcc(addrStart, cont)
     end
     function myNet.resumeROM(cont)
         if not sendReset() then return end
