@@ -102,6 +102,7 @@ local function mkROMDevice(addr, devIO, isAlerted)
         if romCommand == 0xf0 then return mkSearchAddress() end
         if romCommand == 0xcc then isSelected = false return devIO() end
         if romCommand == 0xa5 and isSelected then return devIO() end
+        if romCommand == 0xec and isAlerted() then return mkSearchAddress() end
         return waitReset
     end
     function romDev.resetPulse()
@@ -123,7 +124,7 @@ function OneWireSimulator.mkDS2401(addr)
         myAddr[i + 1] = addr[i]
     end
     local myDev, waitReset = nil, nil
-    myDev, waitReset = mkROMDevice(myAddr, function () return waitReset end)
+    myDev, waitReset = mkROMDevice(myAddr, function() return waitReset end, function() return false end)
     return myDev
 end
 
@@ -170,7 +171,7 @@ function OneWireSimulator.mkDS2413(addr, readIO, writeIO)
         return mkReceiveByte(processPIO)
     end
     local myDev = nil
-    myDev, waitReset =  mkROMDevice(myAddr, pioFunction)
+    myDev, waitReset =  mkROMDevice(myAddr, pioFunction, function() return false end)
     return myDev
 end
 
