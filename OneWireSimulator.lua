@@ -1,7 +1,7 @@
 #!/usr/bin/lua
 
 local bit = require("bit")
-local band, bor, blshift, tohex, brshift, bxor = bit.band, bit.bor, bit.lshift, bit.tohex, bit.rshift, bit.bxor
+local band, bor, blshift, tohex, brshift, bxor, bnot = bit.band, bit.bor, bit.lshift, bit.tohex, bit.rshift, bit.bxor, bit.bnot
 local crc = require("OneWireCrc")
 
 local OneWireSimulator = {}
@@ -124,7 +124,8 @@ function OneWireSimulator.mkDS2401(addr)
         myAddr[i + 1] = addr[i]
     end
     local myDev, waitReset = nil, nil
-    myDev, waitReset = mkROMDevice(myAddr, function() return waitReset end, function() return false end)
+    myDev, waitReset = mkROMDevice(myAddr,
+            function() return waitReset end, function() return false end)
     return myDev
 end
 
@@ -167,11 +168,179 @@ function OneWireSimulator.mkDS2413(addr, readIO, writeIO)
         if pioCommand == 0x5a then return redoPIOWrite() end
         return waitReset
     end
-    local function pioFunction()
-        return mkReceiveByte(processPIO)
-    end
     local myDev = nil
-    myDev, waitReset =  mkROMDevice(myAddr, pioFunction, function() return false end)
+    myDev, waitReset = mkROMDevice(myAddr,
+            function() return mkReceiveByte(processPIO) end,
+            function() return false end)
+    return myDev
+end
+
+local function mkDS2408(addr, vccp, readIO, writeIO, assertStrobe, registerRSTZ)
+    myAddr = {0x29}
+    for i = 1,6 do myAddr[i+1] = addr[i] end
+    local lastPIOState = 0
+    local pioOutputLatchState = 0
+    local pioActivityLatchState = 0
+    local conditionalSearchChannel = 0
+    local conditionalSearchPolarity = 0
+    local pinOrActivityLatchSelect = false
+    local conditionalSearchAnd = false
+    local ros = false
+    local powerOnResetLatch = true
+    local waitReset = nil
+    local function goWaitReset() return waitReset end
+
+    local function samplePIOState()
+        local currentPIO = readIO()
+        pioActivityLatchState = bor(pioActivityLatchState, bxor(currentPIO, lastPIOState))
+        lastPIOState = currentPIO
+    end
+    local function changePIOState(newState)
+        pioOutputLatchState = newState
+        writeIO(pioOutputLatchState)
+        return samplePIOState()
+    end
+    local function assertRSTZ()
+        return changePIOState(0xff)
+    end
+    registerRSTZ(assertRSTZ)
+
+    local function loopAA()
+        return mkSendByte(0xAA, loopAA)
+    end
+
+    local function writeCSR(csrByte)
+        pinOrActivityLatchSelect = 0 ~= band(1, csrByte)
+        conditionalSearchAnd = 0 ~= band(2, csrByte)
+        ros = 0 ~= band(4, csrByte)
+        powerOnResetLatch = powerOnResetLatch and 0 ~= band(8, csrByte)
+        return waitReset
+    end
+    local function writeCSP(cspByte)
+        conditionalSearchPolarity = cspByte
+        return mkReceiveByte(writeCSR)
+    end
+    local function writeCSC(cscByte)
+        conditionalSearchChannel = cscByte
+        return mkReceiveByte(writeCSP)
+    end
+    local function writeCReg(regAddr)
+        if regAddr[2] ~= 0 then return waitReset end
+        if regAddr[1] == 0x8b then return mkReceiveByte(writeCSC) end
+        if regAddr[1] == 0x8c then return mkReceiveByte(writeCSP) end
+        if regAddr[1] == 0x8d then return mkReceiveByte(writeCSR) end
+        return waitReset
+    end
+
+    local function sendCRC16(accData, cont)
+        local crcWord = bnot(crc.crc16(accData))
+        local crcL = band(0xff, crcWord)
+        local crcH = band(0xff, brshift(crcWord, 8))
+        return mkSendByte(crcL, function () return mkSendByte(crcH, cont) end)
+    end
+
+    local function send2FF(accData)
+        accData[#accData + 1] = 0xff
+        return mkSendByte(0xff, function () return sendCRC16(accData, goWaitReset) end)
+    end
+    local function send1FF(accData)
+        accData[#accData + 1] = 0xff
+        return mkSendByte(0xff, function () return send2FF(accData) end)
+    end
+    local function sendConfig(accData)
+        local config = 0
+        if pinOrActivityLatchSelect then config = 1 end
+        if conditionalSearchAnd then config = config + 2 end
+        if ros then config = config + 4 end
+        if powerOnResetLatch then config = config + 8 end
+        if vccp then config = config + 0x80 end
+        accData[#accData + 1] = config
+        return mkSendByte(config, function () return send1FF(accData) end)
+    end
+    local function sendCSP(accData)
+        accData[#accData + 1] = conditionalSearchPolarity
+        return mkSendByte(conditionalSearchPolarity, function () return sendConfig(accData) end)
+    end
+    local function sendCSM(accData)
+        accData[#accData + 1] = conditionalSearchChannel
+        return mkSendByte(conditionalSearchChannel, function () return sendCSP(accData) end)
+    end
+    local function sendPIOActivity(accData)
+        accData[#accData + 1] = pioActivityLatchState
+        return mkSendByte(pioActivityLatchState, function () return sendCSM(accData) end)
+    end
+    local function sendPIOOutput(accData)
+        accData[#accData + 1] = pioOutputLatchState
+        return mkSendByte(pioOutputLatchState, function () return sendPIOActivity(accData) end)
+    end
+    local function sendPinState(accData)
+        samplePIOState()
+        accData[#accData + 1] = lastPIOState
+        return mkSendByte(lastPIOState, function () return sendPIOOutput(accData) end)
+    end
+    local function send1s(accData, count)
+        if count == 0 then return sendPinState(accData) end
+        accData[#accData + 1] = 0xff
+        return mkSendByte(0xff, function () return send1s(accData, count - 1) end)
+    end
+    local function readReg(regAddr)
+        if regAddr[2] ~= 0 or regAddr[1] >= 0x90 then return waitReset end
+        local acc = {0xf0,regAddr[1],regAddr[2]}
+        if regAddr[1] < 0x88 then return send1s(acc, 0x88 - regAddr[1]) end
+        if regAddr[1] == 0x88 then return sendPinState(acc) end
+        if regAddr[1] == 0x89 then return sendPIOOutput(acc) end
+        if regAddr[1] == 0x8a then return sendPIOActivity(acc) end
+        if regAddr[1] == 0x8b then return sendCSM(acc) end
+        if regAddr[1] == 0x8c then return sendCSP(acc) end
+        if regAddr[1] == 0x8d then return sendConfig(acc) end
+        if regAddr[1] == 0x8e then return send1FF(acc) end
+        if regAddr[1] == 0x8f then return send2FF(acc) end
+        return waitReset
+    end
+
+    local function redoSample()
+        return mkSendByte(samplePIO, redoSample)
+    end
+    local redoPIOWrite = nil
+    local function sampleOnce()
+        samplePIOState()
+        return mkSendByte(lastPIOState(), redoPIOWrite)
+    end
+    local function setPIO(bytes)
+        if 0xff ~= bxor(bytes[1], bytes[2]) then return goWaitReset end
+        changePIOState(bytes[1])
+        if ros then assertStrobe() end
+        return mkSendByte(0xaa, sampleOnce)
+    end
+    redoPIOWrite = function()
+        return mkReceiveBytes(2, setPIO)
+    end
+
+    local sendPIO = nil
+    local function loopSendPIO(count, accData)
+        if count > 31 then return sendCRC16(accData, function () return sendPIO(0, {}) end) end
+        return sendPIO(count, accData)
+    end
+    sendPIO = function (count, accData)
+        if ros then assertStrobe() end
+        samplePIOState()
+        accData[#accData + 1] = lastPIOState
+        return mkSendByte(lastPIOState, function () return loopSendPIO(count + 1, accData) end)
+    end
+
+    local function pioFunction(pioCommand)
+        if pioCommand == 0xc3 then pioActivityLatchState = 0 return loopAA() end
+        if pioCommand == 0xcc then return mkReceiveBytes(2, writeCReg) end
+        if pioCommand == 0xf0 then return mkReceiveBytes(2, readReg) end
+        if pioCommand == 0x5a then return redoPIOWrite() end
+        if pioCommand == 0xf5 then return sendPIO(0, {0xf5}) end
+        return waitReset
+    end
+
+    local myDev
+    myDev, waitReset = mkROMDevice(myAddr,
+            function() return mkReceiveByte(pioFunction) end,
+            function() return false end)
     return myDev
 end
 
